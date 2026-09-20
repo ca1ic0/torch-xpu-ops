@@ -11,6 +11,8 @@
 #pragma once
 
 #include <bit>
+#include <functional>
+#include <type_traits>
 
 #include <ATen/ceil_div.h>
 #include <ATen/native/Math.h>
@@ -30,6 +32,14 @@ enum ScanType {
   EXCLUSIVE_TYPE = 0,
   INCLUSIVE_TYPE = 1,
 };
+
+// Sub-group width the loop-scan path is built for. LoopScanKernel maps one
+// sub-group to one batch row and derives the row index from this width, so
+// the value is load-bearing in LoopScanKernel, launch_loop_scan, and the
+// with-indices launch geometry (LoopScanConfig::wg_range_x_) alike — every
+// user must reference this single constant, and LoopScanKernel additionally
+// pins it on the device side via SYCL_REQD_SUB_GROUP_SIZE.
+constexpr int64_t kLoopScanSubGroupSize = 32;
 
 template <typename scalar_t, typename idx_t, typename BinaryOperation>
 void binary_op_update(
@@ -227,7 +237,8 @@ class LoopScanConfig {
         func_(func),
         glb_range_x_(0),
         glb_range_y_(0),
-        wg_range_x_(std::min<size_t>(32, std::bit_ceil(problem))),
+        wg_range_x_(
+            std::min<size_t>(kLoopScanSubGroupSize, std::bit_ceil(problem))),
         wg_range_y_(0) {
     size_t wg_size = syclMaxWorkItemsPerSubSlice();
     wg_range_y_ = wg_size / wg_range_x_;
@@ -309,21 +320,43 @@ class LoopScanConfig {
   size_t wg_range_y_;
 };
 
-template <typename LSConfig_, bool TrivialOffCal = false>
+// Inclusive scan over contiguous rows (stride == 1), one sub-group per row.
+// Input/output must be contiguous: scan() guarantees this by calling
+// input.contiguous() and asserting self.is_contiguous(), so offsets are
+// computed trivially (batch * problem + ix) and there is no TrivialOffCal
+// template knob on this path.
+//
+// Two sub-group-uniformity invariants keep this kernel correct; both are
+// enforced in launch_loop_scan:
+// 1. Every lane of a sub-group agrees on `batch = i / kLoopScanSubGroupSize`,
+//    i.e. a sub-group never straddles two rows. This holds because the
+//    launcher picks a work-group size that is a multiple of
+//    kLoopScanSubGroupSize and DPC++ assigns consecutive linear local ids to
+//    consecutive lanes of a sub-group.
+// 2. The grid-stride bound is int64_t(batch) * kLoopScanSubGroupSize, NOT
+//    batch. The bound must stay a multiple of the sub-group size, otherwise
+//    lanes of one sub-group would disagree on the loop exit condition and
+//    diverge into shift_group_right/group_broadcast — a hang, not a wrong
+//    number. Do not "simplify" the bound to cfg_.batch_.
+//
+// SYCL_REQD_SUB_GROUP_SIZE pins the device sub-group width to
+// kLoopScanSubGroupSize; this is a hard launch requirement (parallel_for
+// throws on a device that does not advertise it in sub_group_sizes). All
+// supported XPU devices expose width 32, and launch_loop_scan TORCH_CHECKs
+// it up front so a mismatch surfaces as a clear error.
+template <typename LSConfig_>
 class LoopScanKernel {
   using LSConfig = LSConfig_;
   using T = typename LSConfig::arg_t;
-  using BinaryFunction = typename LSConfig::func_t;
 
  public:
   LoopScanKernel(const LSConfig& cfg) : cfg_(cfg) {}
 
-  SYCL_REQD_SUB_GROUP_SIZE(32) void operator()(sycl::nd_item<1> item) const {
-    static_assert(TrivialOffCal);
-
+  SYCL_REQD_SUB_GROUP_SIZE(kLoopScanSubGroupSize) void operator()(
+      sycl::nd_item<1> item) const {
     const auto sg = item.get_sub_group();
     const auto lane = sg.get_local_id()[0];
-    constexpr int64_t sg_size = 32;
+    constexpr int64_t sg_size = kLoopScanSubGroupSize;
 
     XPU_KERNEL_LOOP_TYPE(item, i, int64_t(cfg_.batch_) * sg_size, int64_t) {
       const int64_t batch = i / sg_size;
@@ -332,13 +365,23 @@ class LoopScanKernel {
         const int64_t ix = base + lane;
         T val = cfg_.init_;
         if (ix < cfg_.problem_) {
-          val = cfg_.input_.data[batch * cfg_.problem_ + ix];
+          val = c10::load(cfg_.input_.data + batch * cfg_.problem_ + ix);
         }
 
-        for (uint32_t offset = 1; offset < sg_size; offset <<= 1) {
-          T tmp = sycl::shift_group_right(sg, val, offset);
-          if (lane >= offset) {
-            val = cfg_.func_(tmp, val);
+        if constexpr (
+            std::is_same_v<typename LSConfig::func_t, std::plus<T>> ||
+            std::is_same_v<typename LSConfig::func_t, std::multiplies<T>>) {
+          // cumsum/cumprod map onto the SYCL group scan primitive directly,
+          // letting the runtime pick a hardware-optimized path. Other
+          // functors (e.g. logcumsumexp's _log_add_exp) are not known
+          // identities and use the generic shift ladder below.
+          val = sycl::inclusive_scan_over_group(sg, val, cfg_.func_);
+        } else {
+          for (uint32_t offset = 1; offset < sg_size; offset <<= 1) {
+            T tmp = sycl::shift_group_right(sg, val, offset);
+            if (lane >= offset) {
+              val = cfg_.func_(tmp, val);
+            }
           }
         }
         val = cfg_.func_(carry, val);
@@ -347,7 +390,12 @@ class LoopScanKernel {
           cfg_.output_.data[batch * cfg_.problem_ + ix] = val;
         }
 
-        carry = sycl::group_broadcast(sg, val, sg_size - 1);
+        // Only the last chunk's carry is dead; skip its broadcast. The
+        // condition is uniform across the sub-group, so this stays
+        // convergent.
+        if (base + sg_size < cfg_.problem_) {
+          carry = sycl::group_broadcast(sg, val, sg_size - 1);
+        }
       }
     }
   }
@@ -411,14 +459,34 @@ class LoopScanWithIndicesKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
   sycl::local_accessor<IndicesT> slm_idx_;
 };
 
-template <typename LSConfig, bool TrivialOffCal = false>
+template <typename LSConfig>
 static inline void launch_loop_scan(const LSConfig& cfg) {
   auto& queue = getCurrentSYCLQueue();
 
-  LoopScanKernel<LSConfig, TrivialOffCal> kfn(cfg);
+  // LoopScanKernel only ever produces an inclusive scan; fail loudly if a
+  // future caller plumbs EXCLUSIVE_TYPE through LoopScanConfig::set_type().
+  TORCH_CHECK(
+      cfg.type_ == INCLUSIVE_TYPE,
+      "loop_scan: only INCLUSIVE_TYPE is supported, got EXCLUSIVE_TYPE");
+  // The kernel is compiled with SYCL_REQD_SUB_GROUP_SIZE(
+  // kLoopScanSubGroupSize); check support up front so an unsupported device
+  // gets a clear error instead of an opaque SYCL launch exception.
+  TORCH_CHECK(
+      syclMaxSubGroupSize() >= kLoopScanSubGroupSize,
+      "loop_scan: device does not support sub-group size ",
+      kLoopScanSubGroupSize);
 
-  constexpr int64_t sg_size = 32;
-  constexpr int64_t wg_size = 256;
+  LoopScanKernel<LSConfig> kfn(cfg);
+
+  constexpr int64_t sg_size = kLoopScanSubGroupSize;
+  const int64_t wg_size =
+      std::min<int64_t>(256, syclDeviceMaxWorkGroupSize());
+  // LoopScanKernel maps one sub-group to one batch row via
+  // batch = linear_id / sg_size; a work-group size that is not a multiple of
+  // the sub-group size would let a sub-group straddle two rows.
+  TORCH_INTERNAL_ASSERT(wg_size % sg_size == 0);
+  // The grid-stride bound must stay a multiple of sg_size so all lanes of a
+  // sub-group share the loop exit condition; see LoopScanKernel's comment.
   const int64_t group_num =
       xpuKernelLoopGroupRange(int64_t(cfg.batch_) * sg_size, wg_size);
   sycl_kernel_submit(group_num * wg_size, wg_size, queue, kfn);
@@ -1010,7 +1078,6 @@ static inline void accumulate_carrier_with_indices(const SSConfig& cfg) {
 
 template <
     ScanType Type,
-    bool TrivialOffCal,
     typename T,
     class InputInfo,
     class OutputInfo,
@@ -1021,6 +1088,8 @@ static inline void loop_scan_kernel(
     int dim_after_collapse,
     T init,
     BinaryFunction func) {
+  // The loop-scan kernel only implements an inclusive scan.
+  static_assert(Type == INCLUSIVE_TYPE);
   auto cfg =
       LoopScanConfig<InputInfo, OutputInfo, OutputInfo, T, BinaryFunction>::
           make_config(
@@ -1032,7 +1101,7 @@ static inline void loop_scan_kernel(
               Type,
               func);
   TORCH_CHECK(1 == cfg.stride_);
-  launch_loop_scan<decltype(cfg), TrivialOffCal>(cfg);
+  launch_loop_scan<decltype(cfg)>(cfg);
 
   return;
 }
@@ -1255,7 +1324,7 @@ void scan(
   int64_t problem = input_info.sizes[dim_after_collapse];
 
   if (dispatch_to_loop_scan_kernel(problem, stride, batch)) {
-    loop_scan_kernel<Type, true>(
+    loop_scan_kernel<Type>(
         input_info, output_info, dim_after_collapse, init, func);
   } else {
     if (batch == 1 && stride == 1) {
