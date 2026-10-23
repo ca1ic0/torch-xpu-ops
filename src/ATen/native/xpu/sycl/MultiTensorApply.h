@@ -9,6 +9,7 @@
  */
 
 #pragma once
+#include <ATen/ceil_div.h>
 #include <ATen/xpu/XPUContext.h>
 #include <c10/core/ScalarType.h>
 #include <comm/xpu_aten.h>
@@ -23,7 +24,6 @@ namespace at::native::xpu {
 
 // Instruction level Parallelism, namely vec size
 static constexpr int64_t kILP = 4;
-static constexpr int64_t kElementPerThread = 128;
 template <typename T>
 bool is_aligned(T* p) {
   return ((uint64_t)p) % (kILP * sizeof(T)) == 0;
@@ -64,9 +64,18 @@ static int64_t multi_tensor_apply_kernel_get_wg_size(int simd) {
   return get_group_reduce_group_size(simd);
 }
 
-static int64_t multi_tensor_apply_kernel_get_chunk_size(int simd) {
+static int64_t multi_tensor_apply_kernel_get_chunk_size(
+    int simd,
+    size_t total_elements) {
+  int64_t wg_size = at::xpu::getDeviceMaxWorkGroupSize();
+  int64_t sub_groups_per_wg = wg_size / simd;
+  int64_t hw_threads = at::xpu::getDeviceHWThreads();
+  int64_t num_wgs = at::ceil_div(hw_threads, sub_groups_per_wg);
+  int64_t element_per_thread =
+      (int64_t)total_elements / (num_wgs * wg_size);
+  element_per_thread = std::max(element_per_thread, (int64_t)1);
   int64_t max_wg_size = multi_tensor_apply_kernel_get_wg_size(simd);
-  return max_wg_size * kElementPerThread;
+  return max_wg_size * element_per_thread;
 }
 
 static inline int64_t multi_tensor_apply_fused_kernel_get_wg_size() {
@@ -85,12 +94,12 @@ struct MultiTensorApplyKernelFunctor : public __SYCL_KER_CONFIG_CONVENTION__ {
     expandAndCall(item_id, std::index_sequence_for<ArgTypes...>());
   }
   MultiTensorApplyKernelFunctor(
-      int64_t kChunkSize_,
+      int64_t chunk_size_,
       T tlAddressMeta_,
       Y tlWGMeta_,
       U callable_,
       ArgTypes... args_)
-      : kChunkSize(kChunkSize_),
+      : chunk_size(chunk_size_),
         tlAddressMeta(tlAddressMeta_),
         tlWGMeta(tlWGMeta_),
         callable(callable_),
@@ -108,14 +117,14 @@ struct MultiTensorApplyKernelFunctor : public __SYCL_KER_CONFIG_CONVENTION__ {
       const {
     // Call the callable with expanded tuple elements
     callable(
-        kChunkSize,
+        chunk_size,
         tlAddressMeta,
         tlWGMeta,
         item_id,
         std::get<Indices>(args)...);
   }
 
-  int64_t kChunkSize;
+  int64_t chunk_size;
   T tlAddressMeta;
   Y tlWGMeta;
   U callable;
@@ -133,19 +142,19 @@ void launch_multi_tensor_apply_kernel(
     Y tlWGMeta,
     U callable,
     int num_wg,
+    int64_t chunk_size,
     ArgTypes... args) {
   auto& q = getCurrentSYCLQueue();
   int64_t simd = at::xpu::getDeviceMaxSubGroupSize();
   int64_t max_wg_size = multi_tensor_apply_kernel_get_wg_size(simd);
-  int64_t kChunkSize = multi_tensor_apply_kernel_get_chunk_size(simd);
 
   if constexpr (fused_kernel) {
     max_wg_size = multi_tensor_apply_fused_kernel_get_wg_size();
-    kChunkSize = multi_tensor_apply_fused_kernel_get_chunk_size();
+    chunk_size = multi_tensor_apply_fused_kernel_get_chunk_size();
   }
 
   MultiTensorApplyKernelFunctor<T, Y, U, ArgTypes...> kfn(
-      kChunkSize, tlAddressMeta, tlWGMeta, callable, args...);
+      chunk_size, tlAddressMeta, tlWGMeta, callable, args...);
 
   sycl_kernel_submit(
       sycl::range<1>(num_wg * max_wg_size),
@@ -167,58 +176,46 @@ void multi_tensor_apply(
   size_t n_tensors = tensor_lists[0].size();
 
   auto& q = getCurrentSYCLQueue();
-  int64_t simd = at::xpu::getDeviceMaxSubGroupSize();
-  int64_t kChunkSize = multi_tensor_apply_kernel_get_chunk_size(simd);
-
-  auto addressStorage = at::empty(
-      {(int)(sizeof(TLMetaForAddressScalar<scalar_vals_t, depth>) * n_tensors)},
-      tensor_lists[0][0].options().dtype(at::kByte));
-  auto metaAddressInput =
-      static_cast<TLMetaForAddressScalar<scalar_vals_t, depth>*>(
-          addressStorage.mutable_data_ptr());
-  TLMetaForAddressScalar<scalar_vals_t, depth>* tlAddress = nullptr;
-
-  auto tlAddress_dptr = at::getHostAllocator(at::kXPU)->allocate(
-      sizeof(TLMetaForAddressScalar<scalar_vals_t, depth>) * n_tensors);
-  tlAddress =
-      (TLMetaForAddressScalar<scalar_vals_t, depth>*)tlAddress_dptr.get();
+  int simd = at::xpu::getDeviceMaxSubGroupSize();
+  size_t total_elements = 0;
+  for (size_t t = 0; t < n_tensors; ++t)
+    total_elements += tensor_lists[0][t].numel();
+  int64_t chunk_size =
+      multi_tensor_apply_kernel_get_chunk_size(simd, total_elements);
   uint64_t totalWG = 0;
+  for (size_t t = 0; t < n_tensors; ++t)
+    totalWG += at::ceil_div(tensor_lists[0][t].numel(), chunk_size);
+
+  const size_t addr_bytes =
+      sizeof(TLMetaForAddressScalar<scalar_vals_t, depth>) * n_tensors;
+  const size_t wg_bytes = sizeof(TLMetaForWG) * totalWG;
+  auto meta_dptr = c10::GetAllocator(c10::DeviceType::XPU)->allocate(
+      addr_bytes + wg_bytes);
+  auto metaAddressInput = static_cast<
+      TLMetaForAddressScalar<scalar_vals_t, depth>*>(meta_dptr.get());
+  auto metaWGInput = reinterpret_cast<TLMetaForWG*>(
+      static_cast<char*>(meta_dptr.get()) + addr_bytes);
+  auto hst_dptr =
+      at::getHostAllocator(at::kXPU)->allocate(addr_bytes + wg_bytes);
+  auto tlAddress = static_cast<
+      TLMetaForAddressScalar<scalar_vals_t, depth>*>(hst_dptr.get());
+  auto tlWGMeta = reinterpret_cast<TLMetaForWG*>(
+      static_cast<char*>(hst_dptr.get()) + addr_bytes);
 
   // this loop record all the tensor address and numel info.
   for (size_t t = 0; t < n_tensors; ++t) {
     auto numel = tensor_lists[0][t].numel();
     tlAddress[t].numel_to_tensor = numel;
     tlAddress[t].scalar_vals = scalars[t].to<scalar_t>();
-    totalWG += (numel + kChunkSize - 1) / kChunkSize;
     for (int d = 0; d < depth; ++d) {
       tlAddress[t].addresses[d] = tensor_lists[d][t].mutable_data_ptr();
     }
   }
-
-  q.memcpy(
-      (void*)metaAddressInput,
-      (void*)tlAddress,
-      sizeof(TLMetaForAddressScalar<scalar_vals_t, depth>) * n_tensors);
-  at::getHostAllocator(at::kXPU)->record_event(
-      (void*)tlAddress,
-      tlAddress_dptr.get_context(),
-      at::xpu::getCurrentXPUStream());
-
-  auto wgMetaStorage = at::empty(
-      {(int)(sizeof(TLMetaForWG) * totalWG)},
-      tensor_lists[0][0].options().dtype(at::kByte));
-  auto metaWGInput =
-      static_cast<TLMetaForWG*>(wgMetaStorage.mutable_data_ptr());
-  TLMetaForWG* tlWGMeta = nullptr;
-
-  auto tlWGMeta_dptr =
-      at::getHostAllocator(at::kXPU)->allocate(sizeof(TLMetaForWG) * totalWG);
-  tlWGMeta = (TLMetaForWG*)tlWGMeta_dptr.get();
   uint64_t posWG = 0;
   // this loop record the correspond tensor and chunk info for each work group.
   for (size_t t = 0; t < n_tensors; ++t) {
     auto numel = tensor_lists[0][t].numel();
-    auto chunkForWG = (numel + kChunkSize - 1) / kChunkSize;
+    auto chunkForWG = (numel + chunk_size - 1) / chunk_size;
     for (size_t chunkId = 0; chunkId < chunkForWG; ++chunkId, ++posWG) {
       tlWGMeta[posWG].wg_to_tensor = t;
       tlWGMeta[posWG].wg_to_chunk = chunkId;
@@ -228,14 +225,14 @@ void multi_tensor_apply(
       posWG == totalWG,
       "Work group index dose not equal to the allocated memory size, segment fault might occur");
 
-  q.memcpy((void*)metaWGInput, (void*)tlWGMeta, sizeof(TLMetaForWG) * totalWG);
+  q.memcpy(meta_dptr.get(), hst_dptr.get(), addr_bytes + wg_bytes);
   at::getHostAllocator(at::kXPU)->record_event(
-      (void*)tlWGMeta,
-      tlWGMeta_dptr.get_context(),
+      static_cast<void*>(tlAddress),
+      hst_dptr.get_context(),
       at::xpu::getCurrentXPUStream());
 
   launch_multi_tensor_apply_kernel<false>(
-      metaAddressInput, metaWGInput, callable, totalWG, args...);
+      metaAddressInput, metaWGInput, callable, totalWG, chunk_size, args...);
 }
 
 template <int depth, typename T, typename... ArgTypes>
@@ -249,55 +246,44 @@ void multi_tensor_apply(
   size_t n_tensors = tensor_lists[0].size();
 
   auto& q = getCurrentSYCLQueue();
-  int64_t simd = at::xpu::getDeviceMaxSubGroupSize();
-  int64_t kChunkSize = multi_tensor_apply_kernel_get_chunk_size(simd);
-
-  auto addressStorage = at::empty(
-      {(int)(sizeof(TLMetaForAddress<depth>) * n_tensors)},
-      tensor_lists[0][0].options().dtype(at::kByte));
-  auto metaAddressInput =
-      static_cast<TLMetaForAddress<depth>*>(addressStorage.mutable_data_ptr());
-  TLMetaForAddress<depth>* tlAddress = nullptr;
-
-  auto tlAddress_dptr = at::getHostAllocator(at::kXPU)->allocate(
-      sizeof(TLMetaForAddress<depth>) * n_tensors);
-  tlAddress = (TLMetaForAddress<depth>*)tlAddress_dptr.get();
+  int simd = at::xpu::getDeviceMaxSubGroupSize();
+  size_t total_elements = 0;
+  for (size_t t = 0; t < n_tensors; ++t)
+    total_elements += tensor_lists[0][t].numel();
+  int64_t chunk_size =
+      multi_tensor_apply_kernel_get_chunk_size(simd, total_elements);
   uint64_t totalWG = 0;
+  for (size_t t = 0; t < n_tensors; ++t)
+    totalWG += at::ceil_div(tensor_lists[0][t].numel(), chunk_size);
+
+  const size_t addr_bytes = sizeof(TLMetaForAddress<depth>) * n_tensors;
+  const size_t wg_bytes = sizeof(TLMetaForWG) * totalWG;
+  auto meta_dptr = c10::GetAllocator(c10::DeviceType::XPU)->allocate(
+      addr_bytes + wg_bytes);
+  auto metaAddressInput =
+      static_cast<TLMetaForAddress<depth>*>(meta_dptr.get());
+  auto metaWGInput = reinterpret_cast<TLMetaForWG*>(
+      static_cast<char*>(meta_dptr.get()) + addr_bytes);
+  auto hst_dptr =
+      at::getHostAllocator(at::kXPU)->allocate(addr_bytes + wg_bytes);
+  auto tlAddress =
+      static_cast<TLMetaForAddress<depth>*>(hst_dptr.get());
+  auto tlWGMeta = reinterpret_cast<TLMetaForWG*>(
+      static_cast<char*>(hst_dptr.get()) + addr_bytes);
 
   // this loop record all the tensor address and numel info.
   for (size_t t = 0; t < n_tensors; ++t) {
     auto numel = tensor_lists[0][t].numel();
     tlAddress[t].numel_to_tensor = numel;
-    totalWG += (numel + kChunkSize - 1) / kChunkSize;
     for (int d = 0; d < depth; ++d) {
       tlAddress[t].addresses[d] = tensor_lists[d][t].mutable_data_ptr();
     }
   }
-
-  q.memcpy(
-      (void*)metaAddressInput,
-      (void*)tlAddress,
-      sizeof(TLMetaForAddress<depth>) * n_tensors);
-  at::getHostAllocator(at::kXPU)->record_event(
-      (void*)tlAddress,
-      tlAddress_dptr.get_context(),
-      at::xpu::getCurrentXPUStream());
-
-  auto wgMetaStorage = at::empty(
-      {(int)(sizeof(TLMetaForWG) * totalWG)},
-      tensor_lists[0][0].options().dtype(at::kByte));
-  auto metaWGInput =
-      static_cast<TLMetaForWG*>(wgMetaStorage.mutable_data_ptr());
-  TLMetaForWG* tlWGMeta = nullptr;
-
-  auto tlWGMeta_dptr =
-      at::getHostAllocator(at::kXPU)->allocate(sizeof(TLMetaForWG) * totalWG);
-  tlWGMeta = (TLMetaForWG*)tlWGMeta_dptr.get();
   uint64_t posWG = 0;
   // this loop record the correspond tensor and chunk info for each work group.
   for (size_t t = 0; t < n_tensors; ++t) {
     auto numel = tensor_lists[0][t].numel();
-    auto chunkForWG = (numel + kChunkSize - 1) / kChunkSize;
+    auto chunkForWG = (numel + chunk_size - 1) / chunk_size;
     for (size_t chunkId = 0; chunkId < chunkForWG; ++chunkId, ++posWG) {
       tlWGMeta[posWG].wg_to_tensor = t;
       tlWGMeta[posWG].wg_to_chunk = chunkId;
@@ -307,14 +293,14 @@ void multi_tensor_apply(
       posWG == totalWG,
       "Work group index dose not equal to the allocated memory size, segment fault might occur");
 
-  q.memcpy((void*)metaWGInput, (void*)tlWGMeta, sizeof(TLMetaForWG) * totalWG);
+  q.memcpy(meta_dptr.get(), hst_dptr.get(), addr_bytes + wg_bytes);
   at::getHostAllocator(at::kXPU)->record_event(
-      (void*)tlWGMeta,
-      tlWGMeta_dptr.get_context(),
+      static_cast<void*>(tlAddress),
+      hst_dptr.get_context(),
       at::xpu::getCurrentXPUStream());
 
   launch_multi_tensor_apply_kernel<false>(
-      metaAddressInput, metaWGInput, callable, totalWG, args...);
+      metaAddressInput, metaWGInput, callable, totalWG, chunk_size, args...);
 }
 
 template <int depth, typename T, typename... ArgTypes>
@@ -329,55 +315,40 @@ void multi_tensor_apply_for_fused_optimizer(
   const auto n_tensors = tensor_lists[0].size();
 
   auto& q = getCurrentSYCLQueue();
-  int64_t kChunkSize = multi_tensor_apply_fused_kernel_get_chunk_size();
-
-  auto addressStorage = at::empty(
-      {(int)(sizeof(TLFusedMetaForAddress<depth>) * n_tensors)},
-      tensor_lists[0][0].options().dtype(at::kByte));
-  auto metaFusedAddressInput = static_cast<TLFusedMetaForAddress<depth>*>(
-      addressStorage.mutable_data_ptr());
-  TLFusedMetaForAddress<depth>* tlAddress = nullptr;
-
-  auto tlAddress_dptr = at::getHostAllocator(at::kXPU)->allocate(
-      sizeof(TLFusedMetaForAddress<depth>) * n_tensors);
-  tlAddress = (TLFusedMetaForAddress<depth>*)tlAddress_dptr.get();
+  int64_t chunk_size = multi_tensor_apply_fused_kernel_get_chunk_size();
   uint64_t totalWG = 0;
+  for (size_t t = 0; t < n_tensors; ++t)
+    totalWG += at::ceil_div(tensor_lists[0][t].numel(), chunk_size);
+
+  const size_t addr_bytes = sizeof(TLFusedMetaForAddress<depth>) * n_tensors;
+  const size_t wg_bytes = sizeof(TLMetaForWG) * totalWG;
+  auto meta_dptr = c10::GetAllocator(c10::DeviceType::XPU)->allocate(
+      addr_bytes + wg_bytes);
+  auto metaFusedAddressInput = static_cast<
+      TLFusedMetaForAddress<depth>*>(meta_dptr.get());
+  auto metaWGInput = reinterpret_cast<TLMetaForWG*>(
+      static_cast<char*>(meta_dptr.get()) + addr_bytes);
+  auto hst_dptr =
+      at::getHostAllocator(at::kXPU)->allocate(addr_bytes + wg_bytes);
+  auto tlAddress = static_cast<
+      TLFusedMetaForAddress<depth>*>(hst_dptr.get());
+  auto tlWGMeta = reinterpret_cast<TLMetaForWG*>(
+      static_cast<char*>(hst_dptr.get()) + addr_bytes);
 
   // this loop record all the tensor address and numel info.
   for (size_t t = 0; t < n_tensors; ++t) {
     auto numel = tensor_lists[0][t].numel();
     tlAddress[t].numel_to_tensor = numel;
     tlAddress[t].state_steps_addresses = state_steps[t].mutable_data_ptr();
-    totalWG += (numel + kChunkSize - 1) / kChunkSize;
     for (int d = 0; d < depth; ++d) {
       tlAddress[t].addresses[d] = tensor_lists[d][t].mutable_data_ptr();
     }
   }
-
-  q.memcpy(
-      (void*)metaFusedAddressInput,
-      (void*)tlAddress,
-      sizeof(TLFusedMetaForAddress<depth>) * n_tensors);
-  at::getHostAllocator(at::kXPU)->record_event(
-      (void*)tlAddress,
-      tlAddress_dptr.get_context(),
-      at::xpu::getCurrentXPUStream());
-
-  auto wgMetaStorage = at::empty(
-      {(int)(sizeof(TLMetaForWG) * totalWG)},
-      tensor_lists[0][0].options().dtype(at::kByte));
-  auto metaWGInput =
-      static_cast<TLMetaForWG*>(wgMetaStorage.mutable_data_ptr());
-  TLMetaForWG* tlWGMeta = nullptr;
-
-  auto tlWGMeta_dptr =
-      at::getHostAllocator(at::kXPU)->allocate(sizeof(TLMetaForWG) * totalWG);
-  tlWGMeta = (TLMetaForWG*)tlWGMeta_dptr.get();
   uint64_t posWG = 0;
   // this loop record the correspond tensor and chunk info for each work group.
   for (size_t t = 0; t < n_tensors; ++t) {
     auto numel = tensor_lists[0][t].numel();
-    auto chunkForWG = (numel + kChunkSize - 1) / kChunkSize;
+    auto chunkForWG = (numel + chunk_size - 1) / chunk_size;
     for (size_t chunkId = 0; chunkId < chunkForWG; ++chunkId, ++posWG) {
       tlWGMeta[posWG].wg_to_tensor = t;
       tlWGMeta[posWG].wg_to_chunk = chunkId;
@@ -387,14 +358,15 @@ void multi_tensor_apply_for_fused_optimizer(
       posWG == totalWG,
       "Work group index dose not equal to the allocated memory size, segment fault might occur");
 
-  q.memcpy((void*)metaWGInput, (void*)tlWGMeta, sizeof(TLMetaForWG) * totalWG);
+  q.memcpy(meta_dptr.get(), hst_dptr.get(), addr_bytes + wg_bytes);
   at::getHostAllocator(at::kXPU)->record_event(
-      (void*)tlWGMeta,
-      tlWGMeta_dptr.get_context(),
+      static_cast<void*>(tlAddress),
+      hst_dptr.get_context(),
       at::xpu::getCurrentXPUStream());
 
   launch_multi_tensor_apply_kernel<true>(
-      metaFusedAddressInput, metaWGInput, callable, totalWG, args...);
+      metaFusedAddressInput, metaWGInput, callable, totalWG, chunk_size,
+      args...);
 }
 
 } // namespace at::native::xpu
