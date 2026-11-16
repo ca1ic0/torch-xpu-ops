@@ -171,9 +171,9 @@ inline void compute_grad_weight_bags_kernel(
 
   acc_type_device<scalar_t, kXPU> weight = 0.f;
   for (int idx = idx_begin; idx < idx_end; ++idx) {
-    const int orig_row = indices_ptr[idx];
-    const int seq_number = offset2bag_ptr[orig_row];
-    const int grad_output_row = seq_number * stride;
+    const index_t orig_row = indices_ptr[idx];
+    const index_t seq_number = offset2bag_ptr[orig_row];
+    const index_t grad_output_row = seq_number * stride;
 
     acc_type_device<scalar_t, kXPU> scale =
         count_ptr ? 1.f / count_ptr[idx] : 1.f;
