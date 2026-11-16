@@ -351,6 +351,20 @@ std::tuple<Tensor, Tensor> batch_norm_gather_stats_xpu(
     double momentum,
     double eps,
     int64_t count) {
+  // batch_norm_reduce_statistics_kernel derives both of its loop bounds from
+  // mean alone, then indexes invstd with them, so any disagreement is an
+  // out-of-bounds read. Validate here, matching the CUDA wrapper (which
+  // forwards to batch_norm_gather_stats_with_counts for these checks).
+  TORCH_CHECK(
+      mean.dim() == 2,
+      "batch_norm_gather_stats: expected mean to be 2-dimensional (world_size, num_features), but got mean of sizes ",
+      mean.sizes());
+  TORCH_CHECK(
+      invstd.sizes() == mean.sizes(),
+      "batch_norm_gather_stats_with_counts: expected invstd to have the same shape as mean (",
+      mean.sizes(),
+      "), but got invstd of sizes ",
+      invstd.sizes());
   return xpu::batch_norm_gather_stats_kernel(
       input, mean, invstd, running_mean, running_var, momentum, eps, count);
 }
@@ -364,6 +378,23 @@ std::tuple<Tensor, Tensor> batch_norm_gather_stats_with_counts_xpu(
     double momentum,
     double eps,
     const Tensor& counts) {
+  TORCH_CHECK(
+      mean.dim() == 2,
+      "batch_norm_gather_stats_with_counts: expected mean to be 2-dimensional (world_size, num_features), but got mean of sizes ",
+      mean.sizes());
+  TORCH_CHECK(
+      invstd.sizes() == mean.sizes(),
+      "batch_norm_gather_stats_with_counts: expected invstd to have the same shape as mean (",
+      mean.sizes(),
+      "), but got invstd of sizes ",
+      invstd.sizes());
+  TORCH_CHECK(
+      counts.numel() >= mean.size(0),
+      "batch_norm_gather_stats_with_counts: expected counts to have at least one element per entry in mean first dimension (",
+      mean.size(0),
+      "), but got ",
+      counts.numel(),
+      " elements");
   return xpu::batch_norm_gather_stats_with_counts_kernel(
       input, mean, invstd, running_mean, running_var, momentum, eps, counts);
 }
