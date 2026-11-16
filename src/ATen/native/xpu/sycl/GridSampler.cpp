@@ -387,7 +387,7 @@ void grid_sampler_2d_backward_kernel_func(
     scalar_t sw = (ix_ne - ix) * (iy - iy_ne);
     scalar_t se = (ix - ix_nw) * (iy - iy_nw);
 
-    scalar_t gix = static_cast<scalar_t>(0), giy = static_cast<scalar_t>(0);
+    opmath_t gix = static_cast<opmath_t>(0), giy = static_cast<opmath_t>(0);
     const scalar_t* gOut_ptr_NCHW =
         grad_output.data + n * gOut_sN + h * gOut_sH + w * gOut_sW;
     index_t NC_offset = n * gInp_sN;
@@ -396,7 +396,7 @@ void grid_sampler_2d_backward_kernel_func(
                  inp_ptr_NC += inp_sC,
                  NC_offset += gInp_sC,
                  gOut_ptr_NCHW += gOut_sC) {
-      const scalar_t gOut = *gOut_ptr_NCHW;
+      const opmath_t gOut = *gOut_ptr_NCHW;
 
       if (input_requires_grad) {
         // calculate and set grad_input
@@ -408,7 +408,7 @@ void grid_sampler_2d_backward_kernel_func(
             gInp_sW,
             inp_H,
             inp_W,
-            nw * gOut,
+            static_cast<scalar_t>(nw * gOut),
             NC_offset);
         at::native::xpu::safe_add_2d(
             grad_input.data,
@@ -418,7 +418,7 @@ void grid_sampler_2d_backward_kernel_func(
             gInp_sW,
             inp_H,
             inp_W,
-            ne * gOut,
+            static_cast<scalar_t>(ne * gOut),
             NC_offset);
         at::native::xpu::safe_add_2d(
             grad_input.data,
@@ -428,7 +428,7 @@ void grid_sampler_2d_backward_kernel_func(
             gInp_sW,
             inp_H,
             inp_W,
-            sw * gOut,
+            static_cast<scalar_t>(sw * gOut),
             NC_offset);
         at::native::xpu::safe_add_2d(
             grad_input.data,
@@ -438,28 +438,28 @@ void grid_sampler_2d_backward_kernel_func(
             gInp_sW,
             inp_H,
             inp_W,
-            se * gOut,
+            static_cast<scalar_t>(se * gOut),
             NC_offset);
       }
 
       // calculate grad_grid
       if (within_bounds_2d(iy_nw, ix_nw, inp_H, inp_W)) {
-        scalar_t nw_val = inp_ptr_NC[iy_nw * inp_sH + ix_nw * inp_sW];
+        opmath_t nw_val = inp_ptr_NC[iy_nw * inp_sH + ix_nw * inp_sW];
         gix -= nw_val * (iy_se - iy) * gOut;
         giy -= nw_val * (ix_se - ix) * gOut;
       }
       if (within_bounds_2d(iy_ne, ix_ne, inp_H, inp_W)) {
-        scalar_t ne_val = inp_ptr_NC[iy_ne * inp_sH + ix_ne * inp_sW];
+        opmath_t ne_val = inp_ptr_NC[iy_ne * inp_sH + ix_ne * inp_sW];
         gix += ne_val * (iy_sw - iy) * gOut;
         giy -= ne_val * (ix - ix_sw) * gOut;
       }
       if (within_bounds_2d(iy_sw, ix_sw, inp_H, inp_W)) {
-        scalar_t sw_val = inp_ptr_NC[iy_sw * inp_sH + ix_sw * inp_sW];
+        opmath_t sw_val = inp_ptr_NC[iy_sw * inp_sH + ix_sw * inp_sW];
         gix -= sw_val * (iy - iy_ne) * gOut;
         giy += sw_val * (ix_ne - ix) * gOut;
       }
       if (within_bounds_2d(iy_se, ix_se, inp_H, inp_W)) {
-        scalar_t se_val = inp_ptr_NC[iy_se * inp_sH + ix_se * inp_sW];
+        opmath_t se_val = inp_ptr_NC[iy_se * inp_sH + ix_se * inp_sW];
         gix += se_val * (iy - iy_nw) * gOut;
         giy += se_val * (ix - ix_nw) * gOut;
       }
@@ -470,8 +470,8 @@ void grid_sampler_2d_backward_kernel_func(
     //   1. use index with gGrid_sW to directly compute gGrid_ptr_NHW
     //   2. directly assign to gGrid_ptr_NHW[0], gGrid_ptr_NHW[1]
     scalar_t* gGrid_ptr_NHW = grad_grid.data + index * gGrid_sW;
-    gGrid_ptr_NHW[0] = gix_mult * gix;
-    gGrid_ptr_NHW[1] = giy_mult * giy;
+    gGrid_ptr_NHW[0] = static_cast<scalar_t>(gix_mult * gix);
+    gGrid_ptr_NHW[1] = static_cast<scalar_t>(giy_mult * giy);
   } else if (interpolation_mode == GridSamplerInterpolation::Nearest) {
     if (input_requires_grad) {
       index_t ix_nearest = static_cast<index_t>(
@@ -528,8 +528,8 @@ void grid_sampler_2d_backward_kernel_func(
     get_cubic_coefficients_grad<scalar_t>(x_coeffs_grad, tx);
     get_cubic_coefficients_grad<scalar_t>(y_coeffs_grad, ty);
 
-    scalar_t gix = static_cast<scalar_t>(0);
-    scalar_t giy = static_cast<scalar_t>(0);
+    opmath_t gix = static_cast<opmath_t>(0);
+    opmath_t giy = static_cast<opmath_t>(0);
 
     const scalar_t* gOut_ptr_NCHW =
         grad_output.data + n * gOut_sN + h * gOut_sH + w * gOut_sW;
@@ -540,7 +540,7 @@ void grid_sampler_2d_backward_kernel_func(
                  gOut_ptr_NCHW += gOut_sC,
                  NC_offset += gInp_sC,
                  inp_ptr_NC += inp_sC) {
-      const scalar_t gOut = *gOut_ptr_NCHW;
+      const opmath_t gOut = *gOut_ptr_NCHW;
 
 #pragma unroll 4
       for (index_t i = 0; i < 4; ++i) {
@@ -562,7 +562,7 @@ void grid_sampler_2d_backward_kernel_func(
           }
 
           // set grid gradient
-          scalar_t val = get_value_bounded<scalar_t>(
+          opmath_t val = get_value_bounded<scalar_t>(
               inp_ptr_NC,
               ix_nw - 1 + i,
               iy_nw - 1 + j,
@@ -580,8 +580,8 @@ void grid_sampler_2d_backward_kernel_func(
     }
 
     scalar_t* gGrid_ptr_NHW = grad_grid.data + index * gGrid_sW;
-    gGrid_ptr_NHW[0] = gix_mult * gix;
-    gGrid_ptr_NHW[1] = giy_mult * giy;
+    gGrid_ptr_NHW[0] = static_cast<scalar_t>(gix_mult * gix);
+    gGrid_ptr_NHW[1] = static_cast<scalar_t>(giy_mult * giy);
   }
 }
 
@@ -1296,8 +1296,8 @@ void grid_sampler_3d_backward_kernel_func(
     scalar_t bsw = (ix_tne - ix) * (iy - iy_tne) * (iz - iz_tne);
     scalar_t bse = (ix - ix_tnw) * (iy - iy_tnw) * (iz - iz_tnw);
 
-    scalar_t gix = static_cast<scalar_t>(0), giy = static_cast<scalar_t>(0),
-             giz = static_cast<scalar_t>(0);
+    opmath_t gix = static_cast<opmath_t>(0), giy = static_cast<opmath_t>(0),
+             giz = static_cast<opmath_t>(0);
     const scalar_t* gOut_ptr_NCDHW = grad_output.data + n * gOut_sN +
         d * gOut_sD + h * gOut_sH + w * gOut_sW;
     index_t NC_offset = n * gInp_sN;
@@ -1307,7 +1307,7 @@ void grid_sampler_3d_backward_kernel_func(
                  gOut_ptr_NCDHW += gOut_sC,
                  NC_offset += gInp_sC,
                  inp_ptr_NC += inp_sC) {
-      const scalar_t gOut = *gOut_ptr_NCDHW;
+      const opmath_t gOut = *gOut_ptr_NCDHW;
 
       if (input_requires_grad) {
         // calculate and set grad_input
@@ -1322,7 +1322,7 @@ void grid_sampler_3d_backward_kernel_func(
             inp_D,
             inp_H,
             inp_W,
-            tnw * gOut,
+            static_cast<scalar_t>(tnw * gOut),
             NC_offset);
         at::native::xpu::safe_add_3d(
             grad_input.data,
@@ -1335,7 +1335,7 @@ void grid_sampler_3d_backward_kernel_func(
             inp_D,
             inp_H,
             inp_W,
-            tne * gOut,
+            static_cast<scalar_t>(tne * gOut),
             NC_offset);
         at::native::xpu::safe_add_3d(
             grad_input.data,
@@ -1348,7 +1348,7 @@ void grid_sampler_3d_backward_kernel_func(
             inp_D,
             inp_H,
             inp_W,
-            tsw * gOut,
+            static_cast<scalar_t>(tsw * gOut),
             NC_offset);
         at::native::xpu::safe_add_3d(
             grad_input.data,
@@ -1361,7 +1361,7 @@ void grid_sampler_3d_backward_kernel_func(
             inp_D,
             inp_H,
             inp_W,
-            tse * gOut,
+            static_cast<scalar_t>(tse * gOut),
             NC_offset);
         at::native::xpu::safe_add_3d(
             grad_input.data,
@@ -1374,7 +1374,7 @@ void grid_sampler_3d_backward_kernel_func(
             inp_D,
             inp_H,
             inp_W,
-            bnw * gOut,
+            static_cast<scalar_t>(bnw * gOut),
             NC_offset);
         at::native::xpu::safe_add_3d(
             grad_input.data,
@@ -1387,7 +1387,7 @@ void grid_sampler_3d_backward_kernel_func(
             inp_D,
             inp_H,
             inp_W,
-            bne * gOut,
+            static_cast<scalar_t>(bne * gOut),
             NC_offset);
         at::native::xpu::safe_add_3d(
             grad_input.data,
@@ -1400,7 +1400,7 @@ void grid_sampler_3d_backward_kernel_func(
             inp_D,
             inp_H,
             inp_W,
-            bsw * gOut,
+            static_cast<scalar_t>(bsw * gOut),
             NC_offset);
         at::native::xpu::safe_add_3d(
             grad_input.data,
@@ -1413,62 +1413,62 @@ void grid_sampler_3d_backward_kernel_func(
             inp_D,
             inp_H,
             inp_W,
-            bse * gOut,
+            static_cast<scalar_t>(bse * gOut),
             NC_offset);
       }
 
       // calculate grad_grid
       if (within_bounds_3d(iz_tnw, iy_tnw, ix_tnw, inp_D, inp_H, inp_W)) {
-        scalar_t tnw_val =
+        opmath_t tnw_val =
             inp_ptr_NC[iz_tnw * inp_sD + iy_tnw * inp_sH + ix_tnw * inp_sW];
         gix -= tnw_val * (iy_bse - iy) * (iz_bse - iz) * gOut;
         giy -= tnw_val * (ix_bse - ix) * (iz_bse - iz) * gOut;
         giz -= tnw_val * (ix_bse - ix) * (iy_bse - iy) * gOut;
       }
       if (within_bounds_3d(iz_tne, iy_tne, ix_tne, inp_D, inp_H, inp_W)) {
-        scalar_t tne_val =
+        opmath_t tne_val =
             inp_ptr_NC[iz_tne * inp_sD + iy_tne * inp_sH + ix_tne * inp_sW];
         gix += tne_val * (iy_bsw - iy) * (iz_bsw - iz) * gOut;
         giy -= tne_val * (ix - ix_bsw) * (iz_bsw - iz) * gOut;
         giz -= tne_val * (ix - ix_bsw) * (iy_bsw - iy) * gOut;
       }
       if (within_bounds_3d(iz_tsw, iy_tsw, ix_tsw, inp_D, inp_H, inp_W)) {
-        scalar_t tsw_val =
+        opmath_t tsw_val =
             inp_ptr_NC[iz_tsw * inp_sD + iy_tsw * inp_sH + ix_tsw * inp_sW];
         gix -= tsw_val * (iy - iy_bne) * (iz_bne - iz) * gOut;
         giy += tsw_val * (ix_bne - ix) * (iz_bne - iz) * gOut;
         giz -= tsw_val * (ix_bne - ix) * (iy - iy_bne) * gOut;
       }
       if (within_bounds_3d(iz_tse, iy_tse, ix_tse, inp_D, inp_H, inp_W)) {
-        scalar_t tse_val =
+        opmath_t tse_val =
             inp_ptr_NC[iz_tse * inp_sD + iy_tse * inp_sH + ix_tse * inp_sW];
         gix += tse_val * (iy - iy_bnw) * (iz_bnw - iz) * gOut;
         giy += tse_val * (ix - ix_bnw) * (iz_bnw - iz) * gOut;
         giz -= tse_val * (ix - ix_bnw) * (iy - iy_bnw) * gOut;
       }
       if (within_bounds_3d(iz_bnw, iy_bnw, ix_bnw, inp_D, inp_H, inp_W)) {
-        scalar_t bnw_val =
+        opmath_t bnw_val =
             inp_ptr_NC[iz_bnw * inp_sD + iy_bnw * inp_sH + ix_bnw * inp_sW];
         gix -= bnw_val * (iy_tse - iy) * (iz - iz_tse) * gOut;
         giy -= bnw_val * (ix_tse - ix) * (iz - iz_tse) * gOut;
         giz += bnw_val * (ix_tse - ix) * (iy_tse - iy) * gOut;
       }
       if (within_bounds_3d(iz_bne, iy_bne, ix_bne, inp_D, inp_H, inp_W)) {
-        scalar_t bne_val =
+        opmath_t bne_val =
             inp_ptr_NC[iz_bne * inp_sD + iy_bne * inp_sH + ix_bne * inp_sW];
         gix += bne_val * (iy_tsw - iy) * (iz - iz_tsw) * gOut;
         giy -= bne_val * (ix - ix_tsw) * (iz - iz_tsw) * gOut;
         giz += bne_val * (ix - ix_tsw) * (iy_tsw - iy) * gOut;
       }
       if (within_bounds_3d(iz_bsw, iy_bsw, ix_bsw, inp_D, inp_H, inp_W)) {
-        scalar_t bsw_val =
+        opmath_t bsw_val =
             inp_ptr_NC[iz_bsw * inp_sD + iy_bsw * inp_sH + ix_bsw * inp_sW];
         gix -= bsw_val * (iy - iy_tne) * (iz - iz_tne) * gOut;
         giy += bsw_val * (ix_tne - ix) * (iz - iz_tne) * gOut;
         giz += bsw_val * (ix_tne - ix) * (iy - iy_tne) * gOut;
       }
       if (within_bounds_3d(iz_bse, iy_bse, ix_bse, inp_D, inp_H, inp_W)) {
-        scalar_t bse_val =
+        opmath_t bse_val =
             inp_ptr_NC[iz_bse * inp_sD + iy_bse * inp_sH + ix_bse * inp_sW];
         gix += bse_val * (iy - iy_tnw) * (iz - iz_tnw) * gOut;
         giy += bse_val * (ix - ix_tnw) * (iz - iz_tnw) * gOut;
@@ -1482,9 +1482,9 @@ void grid_sampler_3d_backward_kernel_func(
     //   2. directly assign to gGrid_ptr_NDHW[0], gGrid_ptr_NDHW[1],
     //   gGrid_ptr_NDHW[2]
     scalar_t* gGrid_ptr_NDHW = grad_grid.data + index * gGrid_sW;
-    gGrid_ptr_NDHW[0] = gix_mult * gix;
-    gGrid_ptr_NDHW[1] = giy_mult * giy;
-    gGrid_ptr_NDHW[2] = giz_mult * giz;
+    gGrid_ptr_NDHW[0] = static_cast<scalar_t>(gix_mult * gix);
+    gGrid_ptr_NDHW[1] = static_cast<scalar_t>(giy_mult * giy);
+    gGrid_ptr_NDHW[2] = static_cast<scalar_t>(giz_mult * giz);
   } else if (interpolation_mode == GridSamplerInterpolation::Nearest) {
     if (input_requires_grad) {
       auto ix_nearest = static_cast<index_t>(std::round(ix));
