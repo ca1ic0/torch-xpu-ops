@@ -451,7 +451,8 @@ void launch_convert_indices_from_coo_to_csr_xpu_kernel(
     return;
   }
 
-  const input_t* data_in = input.const_data_ptr<input_t>();
+  const auto input_ = input.expect_contiguous();
+  const input_t* data_in = input_->const_data_ptr<input_t>();
   output_t* data_out = result.data_ptr<output_t>();
 
   constexpr auto kernel_func =
