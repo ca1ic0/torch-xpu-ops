@@ -870,7 +870,7 @@ Tensor ctc_loss_backward_kernel_template(
   // input length.
   bool is_large = (2 * log_probs.size(0) + (24 * batch_size) / 10 +
                    (2 * num_labels) / 10) > 450;
-  if (is_large) { // large alphabet, large batch
+  if (is_large && !globalContext().deterministicAlgorithms()) { // large alphabet, large batch
     // this computes the probs, minuend in (16)
     at::exp_out(grad, log_probs);
     // now we compute the subtrahend for the blanks. It is a straightforward
@@ -950,7 +950,7 @@ Tensor ctc_loss_backward_kernel_template(
         tg_target_stride,
         batch_size,
         zero_infinity);
-  } else { // small problem, use naive algorithm
+  } else { // Small problem or deterministic mode: use the naive algorithm.
     constexpr auto kfn = ctc_loss_backward_collect_kernel<scalar_t, target_t>;
     max_threads = at::xpu::getKernelMaxWorkGroupSize<kfn>();
     int threads_input = max_threads;
@@ -1064,9 +1064,6 @@ Tensor ctc_loss_backward_kernel(
     const Tensor& log_alpha,
     int64_t BLANK,
     bool zero_infinity) {
-  // See Note [Writing Nondeterministic Operations]
-  // Nondeterministic because of atomicAdd usage
-  globalContext().alertNotDeterministic("ctc_loss_backward_xpu");
   return AT_DISPATCH_FLOATING_TYPES(
       log_probs.scalar_type(), "ctc_loss_backward_xpu", [&] {
         if (targets.scalar_type() == kLong) {

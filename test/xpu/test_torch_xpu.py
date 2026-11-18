@@ -184,6 +184,21 @@ TestTorchDeviceType.test_nondeterministic_alert_histc = (
 )
 
 
+def _test_nondeterministic_alert_CTCLoss(self, device):
+    self.skipTest(
+        "ctc_loss_backward is deterministic on XPU: it takes the naive "
+        "non-atomic path under torch.use_deterministic_algorithms(True). "
+        "Upstream removed this test in pytorch/pytorch@56ac168 (#201617); "
+        "see test/regressions/test_ctc_loss_deterministic.py for the oracle."
+    )
+
+
+if hasattr(TestTorchDeviceType, "test_nondeterministic_alert_CTCLoss"):
+    TestTorchDeviceType.test_nondeterministic_alert_CTCLoss = (
+        _test_nondeterministic_alert_CTCLoss
+    )
+
+
 @onlyXPU
 def _test_memory_format_cpu_and_cuda_ops(self, device):
     def get_generator(memory_format, shape):
