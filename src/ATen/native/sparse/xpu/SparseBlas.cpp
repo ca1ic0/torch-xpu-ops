@@ -48,6 +48,11 @@ Tensor& sparse_sampled_addmm_out_sparse_csr_xpu(
     const Scalar& beta,
     const Scalar& alpha,
     Tensor& result) {
+  if (at::sparse_csr::has_noncontiguous_values(result)) {
+    return at::sparse_csr::run_on_contiguous_clone(result, [&](Tensor& r) {
+      sparse_sampled_addmm_out_sparse_csr_xpu(self, mat1, mat2, beta, alpha, r);
+    });
+  }
   at::native::sparse::sparse_sampled_addmm_check_inputs(
       self, mat1, mat2, beta, alpha, result);
 

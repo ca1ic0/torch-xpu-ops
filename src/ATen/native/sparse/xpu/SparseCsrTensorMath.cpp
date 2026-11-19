@@ -432,6 +432,12 @@ Tensor& add_out_sparse_compressed_xpu(
       return out;
     }
 
+    if (at::sparse_csr::has_noncontiguous_values(out)) {
+      return at::sparse_csr::run_on_contiguous_clone(out, [&](Tensor& r) {
+        add_out_sparse_compressed_xpu(self, other, alpha, r);
+      });
+    }
+
     at::native::resize_as_sparse_compressed_(out, self);
     TORCH_INTERNAL_ASSERT(out.is_sparse_csr());
     xpu::add_out_sparse_csr_kernel(self, other, alpha, out);

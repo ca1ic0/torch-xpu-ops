@@ -172,8 +172,14 @@ void add_out_sparse_csr_kernel(
               auto a_col = A.col_indices().to(output_indices_dtype);
               auto b_crow = B.crow_indices().to(output_indices_dtype);
               auto b_col = B.col_indices().to(output_indices_dtype);
-              auto a_val = A.values().to(output_values_dtype);
-              auto b_val = B.values().to(output_values_dtype);
+              // .to() is a no-op returning the same strided view when the
+              // dtypes already match, but the kernels below read raw data
+              // pointers: materialize non-contiguous input values. The
+              // in-place add_ path hands such a self through the
+              // run_on_contiguous_clone guard, and so may a direct call
+              // whose operands carry a values view.
+              auto a_val = A.values().to(output_values_dtype).contiguous();
+              auto b_val = B.values().to(output_values_dtype).contiguous();
 
               const index_t* a_crow_ptr = a_crow.const_data_ptr<index_t>();
               const index_t* a_col_ptr = a_col.const_data_ptr<index_t>();
