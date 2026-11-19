@@ -207,6 +207,11 @@ Tensor& addmm_out_sparse_compressed_xpu(
     const Scalar& beta,
     const Scalar& alpha,
     Tensor& result) {
+  if (at::sparse_csr::has_noncontiguous_values(result)) {
+    return at::sparse_csr::run_on_contiguous_clone(result, [&](Tensor& r) {
+      addmm_out_sparse_compressed_xpu(self, mat1, mat2, beta, alpha, r);
+    });
+  }
   TORCH_CHECK(
       self.is_xpu(),
       "Expected all tensors to be on the same device. addmm expected self to be XPU tensor, but got ",
