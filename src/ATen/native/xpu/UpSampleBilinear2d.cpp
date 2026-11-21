@@ -39,15 +39,27 @@ TORCH_IMPL_FUNC(upsample_bilinear2d_backward_out_xpu)
  std::optional<double> scales_h,
  std::optional<double> scales_w,
  const Tensor& grad_input) {
-  globalContext().alertNotDeterministic("upsample_bilinear2d_backward_out_xpu");
-  xpu::upsample_bilinear2d_backward_out_kernel(
-      grad_input,
-      grad_output,
-      output_size,
-      input_size,
-      align_corners,
-      scales_h,
-      scales_w);
+  // See Note [Enabling Deterministic Operations]
+  // Use alternate implementation which avoids atomicAdd
+  if (globalContext().deterministicAlgorithms()) {
+    xpu::upsample_bilinear2d_backward_out_kernel_deterministic(
+        grad_input,
+        grad_output,
+        output_size,
+        input_size,
+        align_corners,
+        scales_h,
+        scales_w);
+  } else {
+    xpu::upsample_bilinear2d_backward_out_kernel(
+        grad_input,
+        grad_output,
+        output_size,
+        input_size,
+        align_corners,
+        scales_h,
+        scales_w);
+  }
 }
 
 TORCH_IMPL_FUNC(_upsample_bilinear2d_aa_out_xpu)

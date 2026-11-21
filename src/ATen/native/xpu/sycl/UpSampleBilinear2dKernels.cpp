@@ -591,6 +591,169 @@ void launch_upsample_bilinear2d_backward_kernel(
   }
 }
 
+// Helper function to compute output pixel range that can contribute to
+// input pixel. Ported from CUDA UpSampleBilinear2d.cu.
+template <typename accscalar_t>
+static inline void compute_output_range(
+    int input_pos,
+    accscalar_t scale,
+    int output_size,
+    bool align_corners,
+    int& min_output,
+    int& max_output) {
+  if (scale == static_cast<accscalar_t>(0)) {
+    min_output = input_pos == 0 ? 0 : 1;
+    max_output = input_pos == 0 ? output_size - 1 : 0;
+    return;
+  }
+
+  accscalar_t lo, hi;
+  if (align_corners) {
+    lo = static_cast<accscalar_t>(input_pos - 1) / scale;
+    hi = static_cast<accscalar_t>(input_pos + 1) / scale;
+  } else {
+    lo = (input_pos - static_cast<accscalar_t>(0.5)) / scale -
+        static_cast<accscalar_t>(0.5);
+    hi = (input_pos + static_cast<accscalar_t>(1.5)) / scale -
+        static_cast<accscalar_t>(0.5);
+  }
+  const int min_output_bound = static_cast<int>(sycl::ceil(lo));
+  const int max_output_bound = static_cast<int>(sycl::floor(hi));
+  // The inverse bounds are rounded in accscalar_t. Include one extra output on
+  // each side and filter by exact interpolation participation below.
+  min_output = min_output_bound > 0 ? min_output_bound - 1 : 0;
+  max_output =
+      max_output_bound < output_size - 1 ? max_output_bound + 1 : output_size - 1;
+}
+
+template <typename accscalar_t>
+static inline accscalar_t compute_linear_axis_weight(
+    const int input_pos,
+    const int input_base,
+    const int input_step,
+    const accscalar_t input_lambda) {
+  accscalar_t weight = 0;
+  if (input_pos == input_base) {
+    weight += static_cast<accscalar_t>(1) - input_lambda;
+  }
+  if (input_pos == input_base + input_step) {
+    weight += input_lambda;
+  }
+  return weight;
+}
+
+// Deterministic gather-based backward: each work item computes one grad_input
+// element by summing the bounded set of grad_output elements that map to it.
+// No atomics, so runs are bit-reproducible. Ported from the CUDA
+// upsample_bilinear2d_backward_gather family.
+template <typename scalar_t, typename accscalar_t, bool is_channel_last>
+SYCL_EXT_ONEAPI_FUNCTION_PROPERTY(
+    (sycl::ext::oneapi::experimental::nd_range_kernel<1>))
+void upsample_bilinear2d_backward_gather_kernel(
+    const int input_height,
+    const int input_width,
+    const int output_height,
+    const int output_width,
+    const accscalar_t rheight,
+    const accscalar_t rwidth,
+    const bool align_corners,
+    scalar_t* idata,
+    const scalar_t* odata,
+    const int channels,
+    const size_t i_numel) {
+  sycl::nd_item<1> item = sycl::ext::oneapi::this_work_item::get_nd_item<1>();
+  const size_t index = item.get_global_linear_id();
+  if (index >= i_numel) {
+    return;
+  }
+
+  int c, w1, h1;
+  size_t nc; // n * channels for NCHW, n for channels_last
+  if constexpr (is_channel_last) {
+    c = index % channels;
+    w1 = (index / channels) % input_width;
+    h1 = (index / channels / input_width) % input_height;
+    nc = index / channels / input_width / input_height;
+  } else {
+    nc = index / input_width / input_height;
+    c = nc % channels;
+    w1 = index % input_width;
+    h1 = (index / input_width) % input_height;
+  }
+
+  accscalar_t grad_sum = 0;
+  const size_t output_plane = static_cast<size_t>(output_height) * output_width;
+
+  int h2_min, h2_max, w2_min, w2_max;
+  compute_output_range<accscalar_t>(
+      h1, rheight, output_height, align_corners, h2_min, h2_max);
+  compute_output_range<accscalar_t>(
+      w1, rwidth, output_width, align_corners, w2_min, w2_max);
+
+  for (int h2 = h2_min; h2 <= h2_max; ++h2) {
+    for (int w2 = w2_min; w2 <= w2_max; ++w2) {
+      const accscalar_t h1r = area_pixel_compute_source_index<accscalar_t>(
+          rheight, h2, align_corners, /*cubic=*/false);
+      const int h1_base = static_cast<int>(h1r);
+      const int h1p = (h1_base < input_height - 1) ? 1 : 0;
+      const accscalar_t h1lambda = h1r - h1_base;
+      const bool h1_participates = h1 == h1_base || h1 == h1_base + h1p;
+
+      const accscalar_t w1r = area_pixel_compute_source_index<accscalar_t>(
+          rwidth, w2, align_corners, /*cubic=*/false);
+      const int w1_base = static_cast<int>(w1r);
+      const int w1p = (w1_base < input_width - 1) ? 1 : 0;
+      const accscalar_t w1lambda = w1r - w1_base;
+      const bool w1_participates = w1 == w1_base || w1 == w1_base + w1p;
+
+      size_t output_idx;
+      if constexpr (is_channel_last) {
+        output_idx = idx_cl<size_t>(
+            nc, h2, w2, c, output_height, output_width, channels);
+      } else {
+        output_idx = nc * output_plane +
+            static_cast<size_t>(h2) * output_width + w2;
+      }
+
+      if (h1p == 0 || w1p == 0) {
+        // Preserve each corner contribution at aliased boundaries; merging
+        // zero weights changes IEEE-754 results for non-finite inputs.
+        if (h1_participates && w1_participates) {
+          const accscalar_t output =
+              static_cast<accscalar_t>(odata[output_idx]);
+          const accscalar_t h0lambda =
+              static_cast<accscalar_t>(1) - h1lambda;
+          const accscalar_t w0lambda =
+              static_cast<accscalar_t>(1) - w1lambda;
+          if (h1 == h1_base && w1 == w1_base) {
+            grad_sum += h0lambda * w0lambda * output;
+          }
+          if (h1 == h1_base && w1 == w1_base + w1p) {
+            grad_sum += h0lambda * w1lambda * output;
+          }
+          if (h1 == h1_base + h1p && w1 == w1_base) {
+            grad_sum += h1lambda * w0lambda * output;
+          }
+          if (h1 == h1_base + h1p && w1 == w1_base + w1p) {
+            grad_sum += h1lambda * w1lambda * output;
+          }
+        }
+      } else {
+        const accscalar_t h1_weight = compute_linear_axis_weight<accscalar_t>(
+            h1, h1_base, h1p, h1lambda);
+        const accscalar_t w1_weight = compute_linear_axis_weight<accscalar_t>(
+            w1, w1_base, w1p, w1lambda);
+        const accscalar_t weight = h1_weight * w1_weight;
+        if (h1_participates && w1_participates) {
+          grad_sum += weight * static_cast<accscalar_t>(odata[output_idx]);
+        }
+      }
+    }
+  }
+
+  idata[index] = static_cast<scalar_t>(grad_sum);
+}
+
 template <typename scalar_t, typename accscalar_t, typename index_t>
 SYCL_EXT_ONEAPI_FUNCTION_PROPERTY(
     (sycl::ext::oneapi::experimental::nd_range_kernel<1>))
@@ -1010,6 +1173,131 @@ void upsample_bilinear2d_backward_out_kernel(
               align_corners,
               idata,
               odata);
+
+          if (!grad_input.is_contiguous()) {
+            grad_input.copy_(grad_input_c);
+          }
+        }
+      });
+}
+
+void upsample_bilinear2d_backward_out_kernel_deterministic(
+    const Tensor& grad_input,
+    const Tensor& grad_output_,
+    IntArrayRef output_size,
+    IntArrayRef input_size,
+    bool align_corners,
+    std::optional<double> scales_h,
+    std::optional<double> scales_w) {
+  TensorArg grad_input_arg{grad_input, "grad_input", 1},
+      grad_output_arg{grad_output_, "grad_output_", 2};
+  checkAllSameGPU(__func__, {grad_output_arg, grad_input_arg});
+
+  const int output_height = output_size[0];
+  const int output_width = output_size[1];
+
+  const int nbatch = input_size[0];
+  const int channels = input_size[1];
+  const int input_height = input_size[2];
+  const int input_width = input_size[3];
+
+  if (grad_input.numel() == 0) {
+    return;
+  }
+
+  if (grad_output_.sizes() == grad_input.sizes()) {
+    grad_input.copy_(grad_output_);
+    return;
+  }
+
+  const auto memory_format = grad_output_.suggest_memory_format();
+
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::ScalarType::Half,
+      at::ScalarType::BFloat16,
+      grad_output_.scalar_type(),
+      "upsample_bilinear2d_backward_deterministic_xpu",
+      [&] {
+        using accscalar_t = acc_type_device<scalar_t, kXPU>;
+
+        const accscalar_t rheight = area_pixel_compute_scale<accscalar_t>(
+            input_height, output_height, align_corners, scales_h);
+        const accscalar_t rwidth = area_pixel_compute_scale<accscalar_t>(
+            input_width, output_width, align_corners, scales_w);
+
+        const size_t i_numel = static_cast<size_t>(grad_input.numel());
+
+        if (memory_format == at::MemoryFormat::ChannelsLast &&
+            grad_input.is_contiguous(memory_format)) {
+          Tensor grad_output =
+              grad_output_.contiguous(at::MemoryFormat::ChannelsLast);
+
+          auto idata = grad_input.mutable_data_ptr<scalar_t>();
+          auto odata = grad_output.const_data_ptr<scalar_t>();
+
+          int64_t wg_size = at::xpu::getKernelMaxWorkGroupSize<
+              upsample_bilinear2d_backward_gather_kernel<
+                  scalar_t,
+                  accscalar_t,
+                  true>>();
+          int num_group = at::ceil_div((int64_t)i_numel, (int64_t)wg_size);
+
+          sycl_kernel_submit<
+              upsample_bilinear2d_backward_gather_kernel<
+                  scalar_t,
+                  accscalar_t,
+                  true>>(
+              num_group * wg_size,
+              wg_size,
+              getCurrentSYCLQueue(),
+              0,
+              (int)input_height,
+              (int)input_width,
+              (int)output_height,
+              (int)output_width,
+              rheight,
+              rwidth,
+              align_corners,
+              idata,
+              odata,
+              (int)channels,
+              i_numel);
+        } else {
+          Tensor grad_input_c = grad_input.is_contiguous()
+              ? grad_input
+              : at::empty(grad_input.sizes(), grad_input.options());
+          Tensor grad_output = grad_output_.contiguous();
+
+          auto idata = grad_input_c.mutable_data_ptr<scalar_t>();
+          auto odata = grad_output.const_data_ptr<scalar_t>();
+
+          int64_t wg_size = at::xpu::getKernelMaxWorkGroupSize<
+              upsample_bilinear2d_backward_gather_kernel<
+                  scalar_t,
+                  accscalar_t,
+                  false>>();
+          int num_group = at::ceil_div((int64_t)i_numel, (int64_t)wg_size);
+
+          sycl_kernel_submit<
+              upsample_bilinear2d_backward_gather_kernel<
+                  scalar_t,
+                  accscalar_t,
+                  false>>(
+              num_group * wg_size,
+              wg_size,
+              getCurrentSYCLQueue(),
+              0,
+              (int)input_height,
+              (int)input_width,
+              (int)output_height,
+              (int)output_width,
+              rheight,
+              rwidth,
+              align_corners,
+              idata,
+              odata,
+              (int)channels,
+              i_numel);
 
           if (!grad_input.is_contiguous()) {
             grad_input.copy_(grad_input_c);
